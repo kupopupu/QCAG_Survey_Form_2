@@ -563,6 +563,9 @@
         const supabase = window.supabase.createClient(supabaseUrl, supabaseKey);
 
         // Supabase helpers (JSON sync + file upload)
+        const DB_TABLE_OUTLETS = 'qcag2_outlets';
+        const DB_TABLE_REQUESTS = 'qcag2_requests';
+
         async function getPublicUrl(path) {
             const { data } = supabase.storage.from('qcag-media').getPublicUrl(path);
             return data?.publicUrl || null;
@@ -608,6 +611,72 @@
             if (error) throw error;
             const publicUrl = await getPublicUrl(filePath);
             return { filePath, publicUrl };
+        }
+
+        // Database helpers
+        async function dbFetchOutlets() {
+            const { data, error } = await supabase
+                .from(DB_TABLE_OUTLETS)
+                .select('*')
+                .order('created_at', { ascending: false });
+            if (error) throw error;
+            return data || [];
+        }
+
+        async function dbInsertOutlet(outlet) {
+            const payload = {
+                id: outlet.id,
+                code: outlet.code,
+                name: outlet.name,
+                address: outlet.address,
+                area: outlet.area,
+                created_at: outlet.createdAt
+            };
+            const { error } = await supabase.from(DB_TABLE_OUTLETS).insert(payload);
+            if (error) throw error;
+        }
+
+        async function dbDeleteOutlet(outletId) {
+            // Delete related requests first (if FK not cascaded)
+            await supabase.from(DB_TABLE_REQUESTS).delete().eq('outlet_id', outletId);
+            const { error } = await supabase.from(DB_TABLE_OUTLETS).delete().eq('id', outletId);
+            if (error) throw error;
+        }
+
+        async function dbFetchRequests(outletId) {
+            const { data, error } = await supabase
+                .from(DB_TABLE_REQUESTS)
+                .select('*')
+                .eq('outlet_id', outletId)
+                .order('created_at', { ascending: true });
+            if (error) throw error;
+            return data || [];
+        }
+
+        async function dbInsertRequest(request) {
+            const payload = {
+                id: request.id,
+                outlet_id: request.outletId,
+                surveyor_name: request.surveyorName,
+                outlet_address: request.outletAddress,
+                items: request.items || [],
+                sign_content: request.signContent || null,
+                images: request.images || [],
+                maquettes: request.maquettes || [],
+                status: request.status,
+                comments: request.comments || [],
+                created_at: request.createdAt
+            };
+            const { error } = await supabase.from(DB_TABLE_REQUESTS).insert(payload);
+            if (error) throw error;
+        }
+
+        async function dbUpdateRequest(requestId, updates) {
+            const { error } = await supabase
+                .from(DB_TABLE_REQUESTS)
+                .update(updates)
+                .eq('id', requestId);
+            if (error) throw error;
         }
 
         // Global variables
@@ -872,8 +941,15 @@
         // Outlet management functions
         async function loadOutlets(searchTerm = '', selectedArea = '') {
             try {
-                // In a real app, this would fetch from Supabase
-                const outlets = JSON.parse(localStorage.getItem('outlets') || '[]');
+                // Fetch from Supabase Database
+                let outlets = await dbFetchOutlets();
+                // Fallback to localStorage if DB empty or error handled above
+                if (!outlets || outlets.length === 0) {
+                    outlets = JSON.parse(localStorage.getItem('outlets') || '[]');
+                } else {
+                    // Keep a local cache for offline view
+                    localStorage.setItem('outlets', JSON.stringify(outlets));
+                }
                 const tbody = document.getElementById('outletsTableBody');
                 tbody.innerHTML = '';
 
@@ -1073,44 +1149,50 @@
                 return;
             }
             
+            const outlet = {
+                id: Date.now().toString(),
+                code: outletCode,
+                name: outletName,
+                address: outletAddress,
+                area: outletArea,
+                createdAt: new Date().toISOString()
+            };
+
+            // Insert into Database (primary)
             try {
-                const outlet = {
-                    id: Date.now().toString(),
-                    code: outletCode,
-                    name: outletName,
-                    address: outletAddress,
-                    area: outletArea,
-                    createdAt: new Date().toISOString()
-                };
-
-                outlets.push(outlet);
-                localStorage.setItem('outlets', JSON.stringify(outlets));
-
-                // Sync outlets list to Supabase
-                await syncJsonToSupabase('data/s_qcag2_outlets.json', outlets);
-
-                console.log('Outlet created successfully:', outlet);
-                console.log('Total outlets now:', outlets.length);
-
-                hideAddOutletModal();
-                loadOutlets();
-                loadStatistics();
-                alert('Thêm outlet thành công!');
-            } catch (error) {
-                console.error('Error creating outlet:', error);
-                alert('Có lỗi xảy ra khi tạo outlet. Vui lòng thử lại!');
+                await dbInsertOutlet(outlet);
+            } catch (dbErr) {
+                console.warn('DB insert outlet failed, falling back to local cache:', dbErr?.message || dbErr);
+                // Fallback cache
+                const cached = JSON.parse(localStorage.getItem('outlets') || '[]');
+                cached.push(outlet);
+                localStorage.setItem('outlets', JSON.stringify(cached));
+                // Best-effort sync JSON as legacy fallback
+                try { await syncJsonToSupabase('data/s_qcag2_outlets.json', cached); } catch (_) {}
             }
+
+            console.log('Outlet created successfully:', outlet);
+            console.log('Total outlets now:', outlets.length);
+
+            hideAddOutletModal();
+            // Isolate UI refresh in try to avoid breaking success flow on incidental errors
+            try { loadOutlets(); } catch (_) {}
+            try { loadStatistics(); } catch (_) {}
+            alert('Thêm outlet thành công!');
         }
 
         async function deleteOutlet(outletId) {
             if (confirm('Bạn có chắc chắn muốn xóa outlet này?')) {
-                const outlets = JSON.parse(localStorage.getItem('outlets') || '[]');
-                const updatedOutlets = outlets.filter(outlet => outlet.id !== outletId);
-                localStorage.setItem('outlets', JSON.stringify(updatedOutlets));
-                localStorage.removeItem(`requests_${outletId}`);
-
-                // Sync outlets list to Supabase
-                await syncJsonToSupabase('data/s_qcag2_outlets.json', updatedOutlets);
+                try {
+                    await dbDeleteOutlet(outletId);
+                } catch (dbErr) {
+                    console.warn('DB delete outlet failed, applying local fallback:', dbErr?.message || dbErr);
+                    const outlets = JSON.parse(localStorage.getItem('outlets') || '[]');
+                    const updatedOutlets = outlets.filter(outlet => outlet.id !== outletId);
+                    localStorage.setItem('outlets', JSON.stringify(updatedOutlets));
+                    localStorage.removeItem(`requests_${outletId}`);
+                    try { await syncJsonToSupabase('data/s_qcag2_outlets.json', updatedOutlets); } catch (_) {}
+                }
 
                 loadOutlets();
                 loadStatistics();
@@ -1136,13 +1218,15 @@
                 addRequestBtn.style.display = 'inline-block';
             }
             
-            // Try loading outlet-specific requests from Supabase first
+            // Load requests from Database (fallback to legacy cache if needed)
             try {
-                const remoteRequests = await loadJsonFromSupabase(`data/s_qcag2_requests_${outletId}.json`);
-                if (remoteRequests && Array.isArray(remoteRequests)) {
-                    localStorage.setItem(`requests_${outletId}`, JSON.stringify(remoteRequests));
+                const dbRequests = await dbFetchRequests(outletId);
+                if (Array.isArray(dbRequests)) {
+                    localStorage.setItem(`requests_${outletId}`, JSON.stringify(dbRequests));
                 }
-            } catch {}
+            } catch (e) {
+                console.warn('DB fetch requests failed, using cached:', e?.message || e);
+            }
 
             loadRequests(outletId);
             document.getElementById('requestsModal').classList.remove('hidden');
@@ -1508,20 +1592,15 @@
             const imageFiles = document.getElementById('surveyImages').files;
             const images = [];
             
-            // Convert images to base64 for storage
-            const imagePromises = Array.from(imageFiles).map(file => {
-                return new Promise((resolve) => {
-                    const reader = new FileReader();
-                    reader.onload = function(e) {
-                        images.push({
-                            name: file.name,
-                            data: e.target.result,
-                            size: file.size
-                        });
-                        resolve();
-                    };
-                    reader.readAsDataURL(file);
-                });
+            // Upload images to Storage, collect public URLs
+            const imagePromises = Array.from(imageFiles).map(async (file) => {
+                const pathPrefix = `qcag2/${currentOutletId}/temp`;
+                try {
+                    const uploaded = await uploadFileToBucket(file, pathPrefix);
+                    images.push({ name: file.name, url: uploaded.publicUrl, type: file.type, size: file.size });
+                } catch (err) {
+                    console.warn('Image upload failed:', err?.message || err);
+                }
             });
             
             Promise.all(imagePromises).then(async () => {
@@ -1535,16 +1614,22 @@
                     images: images,
                     createdAt: new Date().toISOString(),
                     status: 'pending',
-                    comments: []
+                    comments: [],
+                    outletId: currentOutletId
                 };
                 
-                // Save request
-                const requests = JSON.parse(localStorage.getItem(`requests_${currentOutletId}`) || '[]');
-                requests.push(request);
-                localStorage.setItem(`requests_${currentOutletId}`, JSON.stringify(requests));
-
-                // Sync requests JSON for this outlet
-                await syncJsonToSupabase(`data/s_qcag2_requests_${currentOutletId}.json`, requests);
+                // Save request to Database (fallback to cache)
+                try {
+                    await dbInsertRequest(request);
+                    const dbRequests = await dbFetchRequests(currentOutletId);
+                    localStorage.setItem(`requests_${currentOutletId}`, JSON.stringify(dbRequests));
+                } catch (dbErr) {
+                    console.warn('DB insert request failed, caching locally:', dbErr?.message || dbErr);
+                    const requests = JSON.parse(localStorage.getItem(`requests_${currentOutletId}`) || '[]');
+                    requests.push(request);
+                    localStorage.setItem(`requests_${currentOutletId}`, JSON.stringify(requests));
+                    try { await syncJsonToSupabase(`data/s_qcag2_requests_${currentOutletId}.json`, requests); } catch (_) {}
+                }
                 
                 hideSurveyModal();
                 loadRequests(currentOutletId);
@@ -1781,38 +1866,31 @@
             };
             
             // If there's an image, convert to base64
-            if (commentImage) {
-                const reader = new FileReader();
-                reader.onload = function(e) {
-                    comment.imageData = e.target.result;
+            // Upload image (optional) and update DB comments JSON
+            try {
+                if (commentImage) {
+                    const uploaded = await uploadFileToBucket(commentImage, `qcag2/${currentOutletId}/${currentRequestId}/comments`);
+                    comment.imageData = uploaded.publicUrl;
                     comment.imageName = commentImage.name;
-                    
-                    requests[requestIndex].comments.push(comment);
-                    localStorage.setItem(`requests_${currentOutletId}`, JSON.stringify(requests));
+                }
 
-                    // Sync to Supabase
-                    syncJsonToSupabase(`data/s_qcag2_requests_${currentOutletId}.json`, requests);
-                    
-                    document.getElementById('newComment').value = '';
-                    document.getElementById('commentImage').value = '';
-                    
-                    loadComments();
-                    alert('Đã thêm yêu cầu chỉnh sửa!');
-                };
-                reader.readAsDataURL(commentImage);
-            } else {
+                // Update local copy
+                requests[requestIndex].comments = requests[requestIndex].comments || [];
                 requests[requestIndex].comments.push(comment);
                 localStorage.setItem(`requests_${currentOutletId}`, JSON.stringify(requests));
 
-                // Sync to Supabase
-                await syncJsonToSupabase(`data/s_qcag2_requests_${currentOutletId}.json`, requests);
-                
-                document.getElementById('newComment').value = '';
-                document.getElementById('commentImage').value = '';
-                
-                loadComments();
-                alert('Đã thêm yêu cầu chỉnh sửa!');
+                // Persist to DB
+                await dbUpdateRequest(currentRequestId, { comments: requests[requestIndex].comments });
+            } catch (e) {
+                console.warn('DB update comment failed, syncing legacy JSON:', e?.message || e);
+                // Fallback legacy JSON sync
+                try { await syncJsonToSupabase(`data/s_qcag2_requests_${currentOutletId}.json`, requests); } catch (_) {}
             }
+
+            document.getElementById('newComment').value = '';
+            document.getElementById('commentImage').value = '';
+            loadComments();
+            alert('Đã thêm yêu cầu chỉnh sửa!');
         }
 
         function showImageModal(imageSrc, imageName) {
@@ -1852,62 +1930,40 @@
             };
             
             // If there's an image, convert to base64
-            if (commentImage) {
-                const reader = new FileReader();
-                reader.onload = function(e) {
-                    comment.imageData = e.target.result;
+            try {
+                if (commentImage) {
+                    const uploaded = await uploadFileToBucket(commentImage, `qcag2/${currentOutletId}/${currentRequestId}/comments`);
+                    comment.imageData = uploaded.publicUrl;
                     comment.imageName = commentImage.name;
-                    
-                    requests[requestIndex].comments.push(comment);
-                    requests[requestIndex].status = 'edit_requested'; // Set status to edit requested
-                    // Remove maquettes when edit is requested
-                    if (requests[requestIndex].maquettes) {
-                        delete requests[requestIndex].maquettes;
-                    }
-                    if (requests[requestIndex].maquette) {
-                        delete requests[requestIndex].maquette;
-                    }
-                    localStorage.setItem(`requests_${currentOutletId}`, JSON.stringify(requests));
+                }
 
-                    // Sync to Supabase
-                    syncJsonToSupabase(`data/s_qcag2_requests_${currentOutletId}.json`, requests);
-                    
-                    document.getElementById('newComment').value = '';
-                    document.getElementById('commentImage').value = '';
-                    
-                    // Update UI immediately
-                    loadComments();
-                    updateRequestDetailStatus();
-                    loadCommentActions();
-                    loadRequests(currentOutletId);
-                    alert('Đã gửi yêu cầu chỉnh sửa!');
-                };
-                reader.readAsDataURL(commentImage);
-            } else {
+                requests[requestIndex].comments = requests[requestIndex].comments || [];
                 requests[requestIndex].comments.push(comment);
-                requests[requestIndex].status = 'edit_requested'; // Set status to edit requested
+                requests[requestIndex].status = 'edit_requested';
                 // Remove maquettes when edit is requested
-                if (requests[requestIndex].maquettes) {
-                    delete requests[requestIndex].maquettes;
-                }
-                if (requests[requestIndex].maquette) {
-                    delete requests[requestIndex].maquette;
-                }
+                delete requests[requestIndex].maquettes;
+                delete requests[requestIndex].maquette;
                 localStorage.setItem(`requests_${currentOutletId}`, JSON.stringify(requests));
 
-                // Sync to Supabase
-                await syncJsonToSupabase(`data/s_qcag2_requests_${currentOutletId}.json`, requests);
-                
-                document.getElementById('newComment').value = '';
-                document.getElementById('commentImage').value = '';
-                
-                // Update UI immediately
-                loadComments();
-                updateRequestDetailStatus();
-                loadCommentActions();
-                loadRequests(currentOutletId);
-                alert('Đã gửi yêu cầu chỉnh sửa!');
+                await dbUpdateRequest(currentRequestId, {
+                    comments: requests[requestIndex].comments,
+                    status: 'edit_requested',
+                    maquettes: []
+                });
+            } catch (e) {
+                console.warn('DB requestEdit failed, syncing legacy JSON:', e?.message || e);
+                try { await syncJsonToSupabase(`data/s_qcag2_requests_${currentOutletId}.json`, requests); } catch (_) {}
             }
+
+            document.getElementById('newComment').value = '';
+            document.getElementById('commentImage').value = '';
+
+            // Update UI immediately
+            loadComments();
+            updateRequestDetailStatus();
+            loadCommentActions();
+            loadRequests(currentOutletId);
+            alert('Đã gửi yêu cầu chỉnh sửa!');
         }
 
         async function completeRequest() {
@@ -1973,34 +2029,45 @@
                 files.forEach(file => {
                     const reader = new FileReader();
                     reader.onload = function(e) {
-                        // Add maquette to request
-                        requests[requestIndex].maquettes.push({
-                            name: file.name,
-                            data: e.target.result,
-                            size: file.size,
-                            uploadedAt: new Date().toISOString()
-                        });
+                        // Add maquette locally using base64 first (for preview)
+                        requests[requestIndex].maquettes.push({ name: file.name, data: e.target.result, size: file.size, uploadedAt: new Date().toISOString() });
                         
                         processedFiles++;
                         
                         // When all files are processed
                         if (processedFiles === totalFiles) {
-                            // Auto complete when maquette is uploaded
-                            requests[requestIndex].status = 'completed';
-                            
-                            localStorage.setItem(`requests_${currentOutletId}`, JSON.stringify(requests));
-                            // Fire and forget sync
-                            syncJsonToSupabase(`data/s_qcag2_requests_${currentOutletId}.json`, requests);
-                            
-                            // Update UI immediately if we're viewing this request
-                            if (currentRequestId === requestId) {
-                                updateRequestDetailStatus();
-                                loadCommentActions();
-                                // Refresh the survey details to show the new maquettes
-                                viewRequestDetail(requestId);
-                            }
-                            loadRequests(currentOutletId);
-                            alert(`Upload ${totalFiles} Maquette thành công! Yêu cầu đã được đánh dấu hoàn thành.`);
+                            // Upload all maquettes to Storage, replace with URLs, complete request
+                            (async () => {
+                                try {
+                                    const uploadedMaquettes = [];
+                                    for (const m of requests[requestIndex].maquettes) {
+                                        // Recreate Blob from base64 for upload
+                                        const res = await fetch(m.data);
+                                        const blob = await res.blob();
+                                        const fileLike = new File([blob], m.name, { type: blob.type || 'image/*' });
+                                        const uploaded = await uploadFileToBucket(fileLike, `qcag2/${currentOutletId}/${requestId}/maquettes`);
+                                        uploadedMaquettes.push({ name: m.name, url: uploaded.publicUrl, uploadedAt: m.uploadedAt });
+                                    }
+                                    requests[requestIndex].maquettes = uploadedMaquettes;
+                                    requests[requestIndex].status = 'completed';
+                                    localStorage.setItem(`requests_${currentOutletId}`, JSON.stringify(requests));
+                                    await dbUpdateRequest(requestId, { maquettes: uploadedMaquettes, status: 'completed' });
+                                } catch (e) {
+                                    console.warn('Upload maquettes to Storage/DB failed, syncing legacy JSON:', e?.message || e);
+                                    localStorage.setItem(`requests_${currentOutletId}`, JSON.stringify(requests));
+                                    try { await syncJsonToSupabase(`data/s_qcag2_requests_${currentOutletId}.json`, requests); } catch (_) {}
+                                } finally {
+                                    // Update UI
+                                    if (currentRequestId === requestId) {
+                                        updateRequestDetailStatus();
+                                        loadCommentActions();
+                                        // Refresh the survey details to show the new maquettes
+                                        viewRequestDetail(requestId);
+                                    }
+                                    loadRequests(currentOutletId);
+                                    alert(`Upload ${totalFiles} Maquette thành công! Yêu cầu đã được đánh dấu hoàn thành.`);
+                                }
+                            })();
                         }
                     };
                     reader.readAsDataURL(file);
